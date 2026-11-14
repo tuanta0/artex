@@ -454,8 +454,22 @@ func nodeConfidence(n *db.Node) string {
 	return ""
 }
 
+// nodeSource returns a fact's declared source ("" when it has none).
+func nodeSource(n *db.Node) string {
+	if n == nil {
+		return ""
+	}
+	var p map[string]any
+	if json.Unmarshal(n.Payload, &p) == nil {
+		if s, ok := p["source"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 // buildCompressionInput renders the connected sub-graph for the §4 prompt:
-// member nodes (summary + id + kind + state + confidence), the internal blood
+// member nodes (summary + id + kind + state + confidence + source + origin), the internal blood
 // edges among members, and — for a §3.1 shared-parent group — the anchor parents
 // as context ("common parent #p"), which are NOT members.
 func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) string {
@@ -476,8 +490,20 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 			state = n.State
 		}
 		line := fmt.Sprintf("- #%d [%s/%s] %s", m, kind, state, nodeSummary(n))
+		// provenance (#124, F4): source is the fact's declared source, origin the
+		// writer recorded by the server.
+		var attrs []string
 		if conf := nodeConfidence(n); conf != "" {
-			line += fmt.Sprintf(" (confidence=%s)", conf)
+			attrs = append(attrs, "confidence="+conf)
+		}
+		if src := nodeSource(n); src != "" {
+			attrs = append(attrs, "source="+src)
+		}
+		if n != nil && n.Origin != "" {
+			attrs = append(attrs, "origin="+n.Origin)
+		}
+		if len(attrs) > 0 {
+			line += " (" + strings.Join(attrs, ", ") + ")"
 		}
 		sb.WriteString(line)
 		sb.WriteByte('\n')
@@ -515,7 +541,7 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 // runs on; thinking disabled (a pure summarization step).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
 	req := llm.CompletionRequest{
-		System:    []string{compressionSystemPrompt},
+		System:    []string{compressionSystem},
 		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
 		MaxTokens: 1500,
 		Thinking:  "disabled",
@@ -530,6 +556,10 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 	}
 	return body, nil
 }
+
+// compressionSystem is the compactor's full system prompt: the §4 body prompt plus
+// the code-owned untrusted-data tail shared with the planner (#124).
+const compressionSystem = compressionSystemPrompt + untrustedDataRules + compactorDataRule
 
 // compressionSystemPrompt is the §4 body prompt.
 const compressionSystemPrompt = `You are compressing a group of [interconnected] exploration nodes into one consolidated conclusion (body), so the planner can quickly grasp "what this area has already established".

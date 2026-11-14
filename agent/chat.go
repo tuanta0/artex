@@ -83,8 +83,13 @@ func chatWorkDirSpec(workDir string) string {
 
 // chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
 // no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
+// Every chat agent, built-in or custom, can read target-derived content through
+// WebFetch or Bash, so all of them get the code-owned untrusted-content tail
+// after the editable body.
 func chatSystem(agentKey, dataDir, workDir string) string {
-	return renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	body := renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()})
+	body += untrustedContentTail(body)
+	return body + chatWorkDirSpec(workDir) + noiseProfileBlock()
 }
 
 // chatVars carries the runtime variables a custom agent's prompt may reference.
@@ -128,13 +133,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		Provider:        c.prov,
 		SystemPrompt:    system,
 		DynamicBoundary: boundary,
-		Tools:           tools,
+		Tools:           withWebFetch(ctx, tools, c.proxyAddr, c.proxyCACert), // WebFetch: routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates; every redirect hop is gated
 		DeferredTools:   def.Deferred,
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
-		EnableWebFetch:  true, // routed through the recording proxy for tracing; loads the proxy CA to verify MITM-resigned HTTPS certificates
-		WebFetchProxy:   c.proxyAddr,
-		WebFetchCACert:  c.proxyCACert,
 		// Web search (optional). ddgs needs no key; brave-free needs BraveKey; tavily needs TavilyKey.
 		// WebSearchProxy is a dedicated egress proxy (http/https/socks5), unrelated to the traffic-recording MITM proxy; empty = direct.
 		EnableWebSearch:       ws.Enabled,
@@ -161,7 +163,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		NonStreaming: c.nonStreaming(), // when this profile selects non-streaming, use Provider.Complete
 		MaxTokens:    c.maxTokens(),    // 0 = send no cap, the server's default decides
 
-		// Opt-in via ARTEX_UNTRUSTED_BOUNDARY (default off): nonce-frame tool output as untrusted data.
+		// On by default; ARTEX_UNTRUSTED_BOUNDARY=0 opts out: nonce-frame tool output as untrusted data.
 		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if c.guard != nil {

@@ -63,6 +63,7 @@ type TaskDTO struct {
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // asset coverage feature switch (fixed at creation)
 	PlanQuietMode      bool               `json:"plan_quiet_mode"`  // planner quiet-mode switch (#86), editable mid-run
+	TargetGate         bool               `json:"target_gate"`      // approval gate for asset targets, opt-in, editable mid-run
 }
 
 // FindingSeverityDTO is the per-severity finding count shown in the task list (critical/high/medium/low).
@@ -138,6 +139,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
 		PlanQuietMode:      t.PlanQuietMode,
+		TargetGate:         t.targetGate.Load(),
 	}
 }
 
@@ -315,6 +317,8 @@ type FindingDTO struct {
 	PoELevel              int                        `json:"poe_level"`
 	VerificationStatus    string                     `json:"verification_status"`
 	VerificationNote      string                     `json:"verification_note"`
+	Counterevidence       string                     `json:"counterevidence,omitempty"`      // what was tested and did not work; optional
+	ConfidenceRationale   string                     `json:"confidence_rationale,omitempty"` // why the conclusion holds; optional
 
 	ID        string `json:"id"`
 	FindingID string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
@@ -456,6 +460,7 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
 		PoELevel: f.PoELevel, VerificationStatus: f.VerificationStatus, VerificationNote: f.VerificationNote,
+		Counterevidence: f.Counterevidence, ConfidenceRationale: f.ConfidenceRationale,
 		VulnClass: f.VulnClass,
 		Name:      f.Name,
 		Severity:  f.Severity,
@@ -598,7 +603,8 @@ type LLMProfileDTO struct {
 	Name            string  `json:"name"`
 	Format          string  `json:"format"`
 	BaseURL         string  `json:"base_url,omitempty"`
-	Proxy           string  `json:"proxy,omitempty"`
+	Proxy           string  `json:"proxy,omitempty"` // masked: the placeholder when set
+	ProxySet        bool    `json:"proxy_set"`
 	Model           string  `json:"model"`
 	APIKeyHint      string  `json:"api_key_hint,omitempty"`
 	RatePerSecond   float64 `json:"rate_per_second"`
@@ -636,7 +642,8 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		Name:             p.Name,
 		Format:           p.Format,
 		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
+		Proxy:            maskedSecret(p.Proxy),
+		ProxySet:         p.Proxy != "",
 		Model:            p.Model,
 		APIKeyHint:       p.APIKeyHint,
 		RatePerSecond:    p.RatePerSecond,

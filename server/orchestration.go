@@ -13,6 +13,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -169,7 +170,7 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
 	}
 	tsx.SetNotify(t.Notify)         // generic wake-up (write ops without a dedicated callback go through it; no-op for read tools)
-	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records a "human added N strategic hints: ..." entry and wakes the planner
+	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records an "orchestrator added N strategic hints: ..." entry and wakes the planner
 	return pick(tsx).Call(ctx, inner, nil)
 }
 
@@ -253,7 +254,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "optional: planner heartbeat interval (seconds). When this much time has passed since the last planning round ended/the task started with no trigger in between → run one planning round (deadlock backstop + wakes the planner to supervise in-flight workers). Empty or 0 = default 600 (10min);"},
 			"seed_first_intent":      map[string]any{"type": "boolean", "description": "optional: enable for simple tasks to issue one seed intent at creation (content = description + goal) so a worker can start testing right away without waiting for the first planner round; default false (the standard plan-then-execute flow)."},
 		}, "description", "goal"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Description          string          `json:"description"`
 				Goal                 string          `json:"goal"`
@@ -307,11 +308,32 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
+			// Target gate: a child spawned from a gated scope is gated too, and keeps
+			// the block rules of the calling task. Read from the caller's scope, never
+			// from parent_ref (optional and written by the model). Pins and allow rules
+			// are never copied. Gate-off caller or no scope: created as before.
+			var gate *bool
+			var blockRules []db.TaskInterceptRuleInput
+			if scope, ok := intercept.TargetScopeFromContext(ctx); ok && scope.Enabled != nil && scope.Enabled() {
+				on := true
+				gate = &on
+				if callerID, err := strconv.ParseInt(scope.TaskID, 10, 64); err == nil && callerID > 0 {
+					block, _, err := s.m.Assets().TaskInterceptRulesSplit(callerID)
+					if err != nil {
+						return actool.Errorf("read the block rules of the calling task: " + err.Error()), nil
+					}
+					for _, r := range block {
+						blockRules = append(blockRules, db.TaskInterceptRuleInput{Enabled: r.Enabled, Action: r.Action, Kind: r.Kind, Pattern: r.Pattern, Note: r.Note})
+					}
+				}
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				InterceptRules:       blockRules,
+				TargetGate:           gate,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -548,9 +570,75 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedFindingTrafficTools()       // adds optional evidence params and read-only evidence tools, preserving user config
 	s.seedFindingWorkflowTools()
 	s.seedFindingVerificationSchema() // S1: poe_level / evidence_quotes on update_finding_report, added once per DB
+	s.seedFindingEvidenceSchema()     // optional counterevidence / confidence_rationale on report_finding, added once per DB
+	s.seedFactSourceSchema()          // source enum on record_fact, added once per DB
+	s.seedTaskScopeDescription()      // add_task_scope: "coverage scope, not enforced" replaces the authorization-boundary text
 	// Note: pentest's default tool bindings need no migration — BuiltinToolSeeds already seeds
 	// list_assets/insert_assets/report_finding/list_findings/list_companies together with
 	// pentest at fresh initialization (no old DBs exist in this project, so no migration).
+}
+
+// seedFactSourceSchema adds the source property (closed enum) to the record_fact
+// schema of existing databases (SeedTool is first-insert only, and ToolResolve
+// serves the stored schema, so without this the model would never see the enum).
+// Idempotent: the property is added only when the stored schema lacks it, and user
+// edits are preserved.
+func (s *Server) seedFactSourceSchema() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "record_fact" {
+			continue
+		}
+		raw, err := json.Marshal(seed.Schema)
+		if err != nil {
+			log.Printf("[facts] record_fact schema: %v", err)
+			return
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return
+		}
+		var properties map[string]json.RawMessage
+		if err := json.Unmarshal(obj["properties"], &properties); err != nil {
+			return
+		}
+		if len(properties["source"]) == 0 {
+			return
+		}
+		_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties','source'],$1::jsonb,true),updated_at=now()
+WHERE key='record_fact' AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? 'source')`, string(properties["source"]))
+		if err != nil {
+			log.Printf("[facts] upgrade record_fact.source: %v", err)
+		}
+		return
+	}
+}
+
+// oldTaskScopeDescription is the add_task_scope description as seeded up to commit
+// 0dc8bdf, which called task_scope the task's authorization boundary. Kept verbatim:
+// seedTaskScopeDescription replaces only a row that still holds exactly this text.
+const oldTaskScopeDescription = "Add test scope to [this task] — this is the task's authorization boundary, and also the denominator of asset test coverage.\n" +
+	"Supported kinds: company (all assets under the company) / root_domain (a whole root domain, including all subdomains) / subdomain (a single precise subdomain) / ip / cidr / icp / keyword.\n" +
+	"Note: hosts a worker touches one by one are [automatically] added to the scope by the system (precise subdomains); this tool is for [deliberate widening] — pulling in a whole root domain / whole company, or adding a specific subdomain/IP.\n" +
+	"value: for company pass the company name or id (the company must already exist); for root_domain/subdomain pass a domain; for ip/cidr pass an IP or range; for icp/keyword pass an ICP number or company keyword.\n" +
+	"Always give reason explaining the basis (auditable). Use the entries array for multiple entries."
+
+// seedTaskScopeDescription brings the add_task_scope description of existing
+// databases to the code text (SeedTool is first-insert only, and ToolResolve serves
+// the stored description, so without this the model would keep reading
+// "authorization boundary"). Idempotent: only a system row still holding the old
+// seeded text is replaced; an absent row or an operator-edited text is left alone.
+func (s *Server) seedTaskScopeDescription() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "add_task_scope" {
+			continue
+		}
+		_, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now()
+WHERE key='add_task_scope' AND system AND description=$2`, seed.Desc, oldTaskScopeDescription)
+		if err != nil {
+			log.Printf("[tools] upgrade add_task_scope description: %v", err)
+		}
+		return
+	}
 }
 
 // refreshBuiltinToolSchemas propagates code schema/description changes on the

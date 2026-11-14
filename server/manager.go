@@ -13,9 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
@@ -68,9 +70,14 @@ type Task struct {
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
 	Guard                *guard.Guard           `json:"-"`
+	TargetGuard          *guard.Guard           `json:"-"` // planner and main-agent hooks: target gate only
 	notify               chan struct{}
 	lifecycleMu          sync.RWMutex
 	llmMu                sync.RWMutex
+	// targetGate is the task's opt-in to the approval gate for asset targets.
+	// Atomic: it is switched through the API while tool calls read it.
+	targetGate  atomic.Bool
+	interceptor *intercept.Interceptor // owner of the target gate, handed to the scope
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -385,6 +392,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Before anything reads a stored secret: load the key, encrypt legacy plaintext.
+	if err := pg.InitSecrets(config.KeyDir()); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("secrets at rest: %w", err)
+	}
 	if err := pg.RecoverFindingRetests(); err != nil {
 		pg.Close()
 		return nil, fmt.Errorf("recover finding retests: %w", err)
@@ -396,6 +408,10 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		log.Printf("[llmusage] create table: %v", err)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	// Behind the global egress proxy a target approval is name-only.
+	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.GlobalProxy() != "" })
+	// The platform's own endpoints need no target approval.
+	m.interceptor.SetDerivedExemptions(m.targetGateEndpoints)
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
@@ -851,7 +867,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 }
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
-	return &Task{
+	t := &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
@@ -869,8 +885,45 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		PlanQuietMode:   pt.PlanQuietMode,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: guard.NewWithInterceptor(ic), TargetGuard: guard.NewTargetOnly(ic), notify: make(chan struct{}, 1),
+		interceptor: ic,
 	}
+	t.targetGate.Store(pt.TargetGate)
+	return t
+}
+
+// targetScope is the approval scope of this task's tool calls for the target
+// gate. wait bounds how long a gated call may wait for a human decision.
+// Enabled reads the task's opt-in flag on every call, so a switch through the
+// API takes effect on the next tool call.
+func (t *Task) targetScope(wait time.Duration) intercept.TargetScope {
+	return intercept.TargetScope{TaskID: t.ID, Enabled: t.targetGate.Load, WaitBound: wait, Interceptor: t.interceptor}
+}
+
+// searchBackendEndpoints are the endpoints of the search backends. The
+// "deepseek" backend has none of its own: it uses the active LLM profile.
+var searchBackendEndpoints = map[string]string{
+	"ddgs":       "https://html.duckduckgo.com",
+	"brave-free": "https://api.search.brave.com",
+	"tavily":     "https://api.tavily.com",
+}
+
+// targetGateEndpoints lists the endpoints of the platform's own services, which
+// the target gate exempts from approval: every LLM gateway, the search backend
+// in use, and the proxies an agent may name on a command line (the recording
+// proxy, the global egress proxy, the search proxy and each profile's proxy).
+// It is read on every gated call, so the exemptions follow the configuration.
+func (m *Manager) targetGateEndpoints() []string {
+	var out []string
+	profiles, _ := m.pg.ListProfiles()
+	for _, p := range profiles {
+		out = append(out, p.BaseURL, p.Proxy)
+	}
+	on, backend, _, _, searchProxy := m.WebSearch()
+	if on {
+		out = append(out, searchBackendEndpoints[backend])
+	}
+	return append(out, searchProxy, m.ProxyAddr(), m.GlobalProxy())
 }
 
 // UpdateTaskMetadata changes list-only task metadata without interrupting any
@@ -899,6 +952,7 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 	// Live switch (#86): runRound reads the flag per round, so the next
 	// planning round (edge or heartbeat) already respects the new value.
 	task.PlanQuietMode = updated.PlanQuietMode
+	task.targetGate.Store(updated.TargetGate)
 	return task, nil
 }
 
@@ -1218,7 +1272,13 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	        WHEN paused_at IS NOT NULL AND deadline_at IS NOT NULL THEN deadline_at + (now() - paused_at)
 	        ELSE deadline_at
 	    END,
-	    paused_at=NULL
+	    paused_at=NULL,
+	    -- A revive (terminal -> non-terminal) starts a new run: drop the previous
+	    -- run's end reason (e.g. budget) so it never marks the new one.
+	    end_reason=CASE
+	        WHEN $2 NOT IN ('done','failed','timeout') THEN ''
+	        ELSE end_reason
+	    END
 	WHERE id=$1 AND deleted_at IS NULL AND status=$6
 	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
 		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
@@ -1411,14 +1471,15 @@ func (m *Manager) StampTaskFirstRun(id string) (int64, error) {
 // SetTaskStatusGuarded sets a TERMINAL status only if the task isn't already terminal
 // (resolves the completed↔timeout race — first terminal writer wins). Reflects the
 // won status on the live handle. won=false means another terminal already stuck.
-func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) {
+// endReason is persisted with the status (empty or db.EndReasonBudget).
+func (m *Manager) SetTaskStatusGuarded(id, status, endReason string) (won bool, err error) {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return false, err
 	}
-	won, err = m.pg.SetTerminalStatusGuarded(n, status)
+	won, err = m.pg.SetTerminalStatusGuarded(n, status, endReason)
 	if err != nil || !won {
 		return won, err
 	}
@@ -1840,16 +1901,17 @@ func (t *Task) NotifyGoal(texts []string) {
 }
 
 // NotifyHint records that one OR MORE hints were added in a single add_hint call —
-// by the human via the main agent, or by cross-task orchestration — then wakes the
-// planner, so the next round is told "the human added N strategy hints: ..." and looks at them
-// directly instead of having to spot the new hint folded into the graph overview.
+// by the human via the main agent (origin "human"), or by cross-task orchestration
+// (origin "orchestrator") — then wakes the planner, so the next round is told who
+// added N strategy hints and looks at them directly instead of having to spot the
+// new hint folded into the graph overview.
 // One call → one trigger event (a batched add_hint counts as one, not one per hint).
-func (t *Task) NotifyHint(texts []string) {
+func (t *Task) NotifyHint(origin string, texts []string) {
 	if len(texts) == 0 {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts})
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts, HintOrigin: origin})
 	t.trigMu.Unlock()
 	t.Notify()
 }

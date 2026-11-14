@@ -447,6 +447,14 @@ func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[in
 			row["company_source"] = "explicit"
 			warnings = append(warnings, fmt.Sprintf("asset %d's company %d has been deleted; restored as unaffiliated", oldID, companyID))
 		}
+		// Archives taken before normalizeURL stripped userinfo can hold
+		// http://user:pass@host URLs. Normalise like the live upserts so the
+		// restore neither stores the credential nor misses the clean row.
+		if typeName, _ := row["type"].(string); typeName == "service" || typeName == "endpoint" {
+			if rawURL, ok := row["url"].(string); ok {
+				row["url"] = normalizeURL(rawURL)
+			}
+		}
 		if existing, found, err := findArchiveAssetNaturalID(tx, row); err != nil {
 			return nil, nil, err
 		} else if found {
@@ -764,6 +772,13 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 		return fmt.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// As in DeleteTaskCascadePrepared: pins stay as revoked history.
+	if err := revokeTaskPins(tx, taskID); err != nil {
+		return err
+	}
+	if err := settleTaskTargetRequests(tx, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1 AND archived_at IS NOT NULL`, taskID); err != nil {

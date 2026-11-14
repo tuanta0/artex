@@ -52,6 +52,9 @@ type Task struct {
 	// PlanQuietMode gates the planner quiet-mode (#86): edge-triggered rounds
 	// are skipped while work is in flight and the open-goal set is unchanged.
 	PlanQuietMode bool `json:"plan_quiet_mode"`
+	// TargetGate is the per-task opt-in of the approval gate for asset targets.
+	// false (default) = no gate, behaviour unchanged.
+	TargetGate bool `json:"target_gate"`
 	// CoverageEnabled is the master switch of the "asset coverage" feature (default true). When false:
 	// do not compute/show test coverage, do not auto-accumulate task_scope (source=auto), do not open
 	// add_task_scope/list_untested_assets to the agent, and do not inject the coverage block into the
@@ -173,6 +176,8 @@ type TaskCreateOptions struct {
 	// chain instead of the single active head. nil = off (default), preserving
 	// the ordered-failover semantics.
 	LLMRotate *bool
+	// TargetGate opts the task into the approval gate for asset targets; nil = off.
+	TargetGate *bool
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -251,10 +256,11 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 	if opts.LLMRotate != nil {
 		rotate = *opts.LLMRotate
 	}
+	t.TargetGate = opts.TargetGate != nil && *opts.TargetGate
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, plan_quiet_mode, coverage_enabled, llm_rotate)
-VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11)
-RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, quietMode, coverageEnabled, rotate).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, plan_quiet_mode, coverage_enabled, llm_rotate, target_gate)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, quietMode, coverageEnabled, rotate, t.TargetGate).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -370,11 +376,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(plan_quiet_mode,true), COALESCE(coverage_enabled,true), COALESCE(llm_rotate,false), first_run_at, deadline_at`
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(plan_quiet_mode,true), COALESCE(coverage_enabled,true), COALESCE(llm_rotate,false), first_run_at, deadline_at, target_gate`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.PlanQuietMode, &t.CoverageEnabled, &t.LLMRotate, &t.FirstRunAt, &t.DeadlineAt); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.PlanQuietMode, &t.CoverageEnabled, &t.LLMRotate, &t.FirstRunAt, &t.DeadlineAt, &t.TargetGate); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -420,6 +426,8 @@ type TaskPatch struct {
 	Pinned *bool
 	// PlanQuietMode flips the per-task quiet-mode switch (#86); nil = leave unchanged.
 	PlanQuietMode *bool
+	// TargetGate flips the per-task target-gate opt-in; nil = leave unchanged.
+	TargetGate *bool
 }
 
 // UpdateTask applies a partial task name/pin mutation and returns the updated row.
@@ -432,9 +440,10 @@ func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
 		WHEN $4::boolean THEN COALESCE(pinned_at, now())
 		ELSE NULL
 	END,
-	plan_quiet_mode = CASE WHEN $5::boolean THEN $6 ELSE plan_quiet_mode END
+	plan_quiet_mode = CASE WHEN $5::boolean THEN $6 ELSE plan_quiet_mode END,
+	target_gate = CASE WHEN $7::boolean THEN $8 ELSE target_gate END
 WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.PlanQuietMode != nil, patch.PlanQuietMode))
+RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.PlanQuietMode != nil, patch.PlanQuietMode, patch.TargetGate != nil, patch.TargetGate))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -505,12 +514,13 @@ func (d *DB) SetQueued(id int64, queued bool) error {
 // SetStatus updates a task's lifecycle status. Entering a terminal state
 // (done/failed/timeout) stamps completed_at once (COALESCE keeps the first stamp
 // stable); moving back to a non-terminal state clears it, so a re-run has no stale
-// finish time.
+// finish time (and no stale end_reason).
 func (d *DB) SetStatus(id int64, status string) error {
 	_, err := d.Exec(`
 UPDATE tasks
    SET status = $1,
-       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END
+       completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END,
+       end_reason = CASE WHEN $1 IN ('done','failed','timeout') THEN end_reason ELSE '' END
  WHERE id = $2`, status, id)
 	return err
 }
@@ -519,17 +529,27 @@ UPDATE tasks
 // terminal, so a completed↔timeout race resolves to the first writer (won=true).
 // Returns won=false (no error) when another terminal status already stuck — the
 // caller then leaves it alone. Non-terminal transitions / re-run still use SetStatus.
-func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err error) {
+// endReason is stored with the status in the same statement (empty = normal end,
+// EndReasonBudget = run-budget wrap-up); a losing writer stores nothing.
+func (d *DB) SetTerminalStatusGuarded(id int64, status, endReason string) (won bool, err error) {
 	res, err := d.Exec(`
 UPDATE tasks
    SET status = $1,
-       completed_at = COALESCE(completed_at, now())
- WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id)
+       completed_at = COALESCE(completed_at, now()),
+       end_reason = $3
+ WHERE id = $2 AND status NOT IN ('done','failed','timeout')`, status, id, endReason)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+// ClearRunEndReason drops the end_reason of a task that is running again (a
+// revived run). A terminal task keeps its reason.
+func (d *DB) ClearRunEndReason(id int64) error {
+	_, err := d.Exec(`UPDATE tasks SET end_reason='' WHERE id=$1 AND end_reason<>'' AND status NOT IN ('done','failed','timeout')`, id)
+	return err
 }
 
 // StampFirstRun records a task's first-real-run moment and computes its absolute
@@ -673,6 +693,14 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
+	// Target pins and approval rows are kept as history too: the pins are revoked,
+	// the open target requests settled, in this transaction.
+	if err := revokeTaskPins(tx, id); err != nil {
+		return result, err
+	}
+	if err := settleTaskTargetRequests(tx, id); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}

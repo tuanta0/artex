@@ -187,13 +187,14 @@ type ToolSet struct {
 	// agent; nil for the goals decomposer (round-0 has no running planner to inform)
 	// and workers → those fall back to the bare notify.
 	notifyGoal func(texts []string)
-	// notifyHint, if set, wakes the planner AND records ONE "human added N strategic
+	// notifyHint, if set, wakes the planner AND records ONE "<origin> added N strategic
 	// hints: …" trigger for a whole add_hint call (batch-aware — one call, one
 	// trigger) so the next round is told the round was fired by a new hint and spells
 	// the hint out, instead of the planner having to spot it folded into the graph
-	// overview. Wired for the main agent + cross-task orchestration; nil elsewhere →
-	// falls back to the bare notify.
-	notifyHint func(texts []string)
+	// overview. origin is the ToolSet's worker (human, orchestrator, or an agent name).
+	// Wired for the main agent + cross-task orchestration; nil elsewhere → falls back
+	// to the bare notify.
+	notifyHint func(origin string, texts []string)
 }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
@@ -203,7 +204,7 @@ func (t *ToolSet) SetNotifyGoal(fn func([]string)) { t.notifyGoal = fn }
 // SetNotifyHint wires the hint-add trigger callback (see ToolSet.notifyHint). Set by
 // the main-agent chat and cross-task orchestration, so a runtime-added hint fires a
 // planner round announced by name instead of a bare wake.
-func (t *ToolSet) SetNotifyHint(fn func([]string)) { t.notifyHint = fn }
+func (t *ToolSet) SetNotifyHint(fn func(string, []string)) { t.notifyHint = fn }
 
 // SetResumeTask wires the task-revive callback (see ToolSet.resumeTask). Set only by
 // the main-agent chat, so runtime-added goals can pull a finished task back to running.
@@ -220,7 +221,7 @@ func (t *ToolSet) SetNotifyFinding(fn func(int64, string)) { t.notifyFinding = f
 // enrich). Kept as an interface here to avoid coupling agent → enrich.
 type EnrichTrigger interface {
 	ResolveDomain(id int64, host string)
-	ProbeSite(id int64, url string)
+	ProbeSite(ctx context.Context, id int64, url string)
 }
 
 // WriteCounts breaks down what a worker persisted this run, by node kind, so the
@@ -273,7 +274,7 @@ func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
 // (the filter basis for asset queries), not merely a coverage denominator, so the
 // agents that own scope definition keep it either way — in lockstep with
 // insertAssets' auto-scope hook, which also runs regardless of the switch.
-var coverageOnlyTools = map[string]bool{"list_untested_assets": true}
+var coverageOnlyTools = map[string]bool{"list_untested_assets": true, "record_coverage": true}
 
 // DropCoverageTools returns tools with the coverage-only ones removed when this
 // task has the feature disabled; otherwise it returns tools unchanged.
@@ -465,7 +466,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		// origin lets the user-message renderers keep the operator's own hints
+		// outside the data envelope (#124, F3).
+		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"], "origin": h.Origin}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -576,8 +579,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["finding_list"] = findingList
 	// recent_facts: the latest window (≤N) of non-folded facts (factNodes is id-DESC,
 	// i.e. newest first). Ones folded into a digest and still cold (hidden) go through
-	// cold_digests and aren't repeated here. Each entry {id, summary, from_intent?,
-	// confidence?}; details like evidence via node_detail(id). Older ones via list_facts.
+	// cold_digests and aren't repeated here. Each entry {id, summary, origin?, source?,
+	// from_intent?, confidence?}; details like evidence via node_detail(id). Older ones
+	// via list_facts.
 	const recentFactsCap = 20
 	recentFacts := make([]map[string]any, 0, recentFactsCap)
 	for _, n := range factNodes {
@@ -587,7 +591,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		if hidden(n.ID) {
 			continue // folded into a digest and still cold — see cold_digests
 		}
-		m := compactNode(n)
+		m := compactFact(n) // summary capped at factSummaryMax (#124, F3)
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // which intent produced this fact
 		}
@@ -997,11 +1001,19 @@ func inheritedIntentSummaryState(state string) bool {
 }
 
 // compactNode distills any exploration node to id + summary + state, dropping the
-// big detail/evidence (fetch that on demand via node_detail).
+// big detail/evidence (fetch that on demand via node_detail). It also carries the
+// provenance (#124, F4): origin is the writer recorded by the server (worker-N,
+// planner, human, orchestrator), source is the declared source of a fact.
 func compactNode(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
 	m := map[string]any{"id": n.ID, "state": n.State, "summary": p["summary"]}
+	if n.Origin != "" {
+		m["origin"] = n.Origin
+	}
+	if s, ok := p["source"].(string); ok && s != "" {
+		m["source"] = s
+	}
 	if n.Inherited {
 		inheritedMap(m, n.SourceTaskID)
 	}
@@ -1064,7 +1076,7 @@ func (t *ToolSet) listFindings() actool.CoreTool {
 const factsPageSize = 20
 
 func (t *ToolSet) listFacts() actool.CoreTool {
-	return t.readExpTool("list_facts", "Page through the [exploration facts/conclusions] of this task and directly related tasks, newest first (compact: id+summary+state; overlong summaries are truncated — full text via node_detail(id)). All parameters optional: limit (default 20, max 100), before (cursor; pass the previous page's next_before for an older page; omit/0 = the newest page), q (filter by summary keyword). Returns {facts, total, has_more, next_before}: total is the filtered count; when has_more=true, keep paging with next_before. Related-task entries carry source_task_id/inherited=true and are read-only. For findings see list_findings.",
+	return t.readExpTool("list_facts", "Page through the [exploration facts/conclusions] of this task and directly related tasks, newest first (compact: id+summary+state+origin+source; origin is the writer, source the declared source of the content; overlong summaries are truncated — full text via node_detail(id)). All parameters optional: limit (default 20, max 100), before (cursor; pass the previous page's next_before for an older page; omit/0 = the newest page), q (filter by summary keyword). Returns {facts, total, has_more, next_before}: total is the filtered count; when has_more=true, keep paging with next_before. Related-task entries carry source_task_id/inherited=true and are read-only. For findings see list_findings.",
 		obj(map[string]any{
 			"limit":  intp("number of entries to return, default 20, max 100"),
 			"before": intp("pagination cursor: return only older facts with id below this value; omit or 0 = the newest page"),
@@ -1100,13 +1112,15 @@ func (t *ToolSet) listFacts() actool.CoreTool {
 		})
 }
 
-// factSummaryMax caps a fact summary in list_facts output. Facts carry one-line
-// conclusions, but nothing enforces brevity; a runaway summary must not bloat a
-// whole page. Full text stays available via node_detail(id).
+// factSummaryMax caps a fact summary in list_facts output and in the overview's
+// recent_facts (#124, F3). Facts carry one-line conclusions, but nothing enforces
+// brevity; a runaway summary must not bloat a whole page, nor carry a long
+// payload into every planner and worker message. Full text stays available via
+// node_detail(id).
 const factSummaryMax = 160
 
-// compactFact is compactNode with the summary rune-capped for list_facts, so a
-// page of facts stays bounded regardless of how long any single summary grew.
+// compactFact is compactNode with the summary rune-capped for list_facts and
+// recent_facts, so they stay bounded regardless of how long any summary grew.
 func compactFact(n *db.Node) map[string]any {
 	m := compactNode(n)
 	if s, ok := m["summary"].(string); ok && len([]rune(s)) > factSummaryMax {
@@ -1288,7 +1302,7 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 }
 
 func (t *ToolSet) proveGoal() actool.CoreTool {
-	return t.writeExpTool("prove_goal", "Call when you judge that a finding/fact proves a goal met: links the evidence node to the goal node and marks the goal met.",
+	return t.writeExpTool("prove_goal", "Call when you judge that a finding/fact proves a goal met: links the evidence node to the goal node and marks the goal met. A fact counts as evidence only when its confidence is observed and its source is not target_response; any other fact is refused and the goal stays open.",
 		obj(map[string]any{
 			"goal_id":     idp("goal node id"),
 			"evidence_id": idp("id of the finding/fact node that proves it"),
@@ -1312,6 +1326,25 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id must be a fact/finding node of this task or a directly related task"), nil
+			}
+			// A fact proves a goal only when it was seen directly (#124, F5): an inferred
+			// conclusion, or one without a confidence, is refused and the goal stays open.
+			// The confidence is declared by the agent that recorded the fact.
+			if evidenceNode.Kind == db.KindFact {
+				var fp map[string]any
+				_ = json.Unmarshal(evidenceNode.Payload, &fp)
+				confidence, _ := fp["confidence"].(string)
+				if strings.ToLower(strings.TrimSpace(confidence)) != "observed" {
+					if confidence == "" {
+						confidence = "none"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding or with an observed fact.", ev, confidence, goal)), nil
+				}
+				// A fact whose declared source is the target's own response is not
+				// authoritative (#124, F4): the target could have planted it.
+				if source, _ := fp["source"].(string); strings.ToLower(strings.TrimSpace(source)) == factSourceTargetResponse {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding or with an observed fact from another source.", ev, goal)), nil
+				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
@@ -1337,11 +1370,26 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
-	return writeTool("goal_met", "[End the entire task immediately] — call only when you are sure [all of the task's goals are truly met and it is complete overall] (note: the task as a [whole]; having met just one goal / one flag / one finding [does not count] — in that case mark that goal with prove_goal). ⚠️ It is NOT for \"ending this planning round\": if there is no new intent to dispatch this round, or you're waiting on worker output, [just end the round — do NOT call this tool] (0 intents is a perfectly normal outcome). Prefer prove_goal to prove goals one by one; goal_met is only a means to skip per-goal proofs and complete the task globally.",
+	return t.writeExpTool("goal_met", "[End the entire task immediately] — call only when you are sure [all of the task's goals are truly met and it is complete overall] (note: the task as a [whole]; having met just one goal / one flag / one finding [does not count] — in that case mark that goal with prove_goal). ⚠️ It is NOT for \"ending this planning round\": if there is no new intent to dispatch this round, or you're waiting on worker output, [just end the round — do NOT call this tool] (0 intents is a perfectly normal outcome). Prefer prove_goal to prove goals one by one; goal_met is only a means to skip per-goal proofs and complete the task globally.",
 		obj(map[string]any{"reason": str("grounds for completion (must be evidence that the goals are truly met, not a round-ending reason like 'no new directions this round')")}, "reason"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// goal_met ends the task only when no goal node is open (#124, F5). A task
+			// without goal nodes keeps the old behavior.
+			goals, err := t.ts.ListByKind(db.KindGoal, 1000)
+			if err != nil {
+				return actool.Errorf("goal_met refused: the goals of this task could not be read (" + err.Error() + "); the task stays open"), nil
+			}
+			open := 0
+			for _, g := range goals {
+				if g.State != "met" {
+					open++
+				}
+			}
+			if open > 0 {
+				return actool.Errorf(fmt.Sprintf("goal_met refused: %d of %d goals of this task are still open; the task stays open. Prove each one with prove_goal(goal_id, evidence_id, reason): the task completes automatically when its last goal is marked met.", open, len(goals))), nil
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			return actool.Text("acknowledged: goal marked met"), nil
@@ -1358,9 +1406,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"evidence_hint_id": idp("optional: the hint node ID in this task corresponding to this finding; automatically carries its structured traffic_refs; cannot reference an inherited hint or another finding's hint"),
 		"traffic_refs": map[string]any{"type": "array", "description": "optional; for HTTP/HTTPS findings, first search and verify entry by entry that the requests/responses actually support the finding's conclusion, then fill in real IDs in reproduction order. For TCP and other non-HTTP findings, or when nothing was captured or no exact record is found, omit or pass [] — it does not block reporting; explain why in evidence and provide other verifiable evidence. Don't guess IDs, infer association by domain/time, or re-probe just to pad the packet count. Roles: baseline = normal control / proof = vulnerability proof / verification = supplementary verification / supporting = auxiliary evidence.",
 			"items": obj(map[string]any{"traffic_id": str("a real traffic ID returned by traffic_search"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("how this traffic supports the finding's conclusion")}, "traffic_id")},
+		"counterevidence":      str("optional: what you tested that did not work (variants, paths, or bypasses that were blocked or came back negative). Fill it when your confidence is not high; omitting it never blocks reporting."),
+		"confidence_rationale": str("optional: why the conclusion holds (which observation rules out the benign explanation). Fill it when your confidence is not high; omitting it never blocks reporting."),
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			Counterevidence                              string            `json:"counterevidence"`
+			ConfidenceRationale                          string            `json:"confidence_rationale"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1388,7 +1440,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), Counterevidence: a.Counterevidence, ConfidenceRationale: a.ConfidenceRationale}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1443,8 +1495,37 @@ type factItem struct {
 	Detail     string            `json:"detail"`
 	Evidence   string            `json:"evidence"`   // one line of key evidence (command + key output lines) supporting the conclusion, for later verification
 	Confidence string            `json:"confidence"` // observed (seen directly) | inferred (inferred from phenomena)
+	Source     string            `json:"source"`     // where the content came from, one of factSources; empty = inference
 	IntentID   json.RawMessage   `json:"intent_id"`
 	AssetIDs   []json.RawMessage `json:"asset_ids"`
+}
+
+// Fact sources (#124, F4): where a fact's content came from, as declared by the
+// agent that recorded it. The writer itself is the node's origin column, set by
+// the server, never by this field.
+const (
+	factSourceTargetResponse  = "target_response"   // content the target itself returned (pages, headers, error bodies)
+	factSourceToolOutput      = "tool_output"       // a tool's own result about the target (port states, scanner verdicts)
+	factSourceThirdPartyIntel = "third_party_intel" // external sources: OSINT, CVE databases, public reports
+	factSourceOperatorInput   = "operator_input"    // given by the human operator
+	factSourceInference       = "inference"         // the agent's own reasoning; the default
+)
+
+var factSources = []string{factSourceTargetResponse, factSourceToolOutput, factSourceThirdPartyIntel, factSourceOperatorInput, factSourceInference}
+
+// normalizeFactSource returns the stored source for a record_fact input: empty
+// means inference, a value outside factSources is an error.
+func normalizeFactSource(s string) (string, error) {
+	norm := strings.ToLower(strings.TrimSpace(s))
+	if norm == "" {
+		return factSourceInference, nil
+	}
+	for _, v := range factSources {
+		if norm == v {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("source %q is not valid: use one of %s (omit it for inference)", s, strings.Join(factSources, ", "))
 }
 
 // recordOneFact writes one fact node and links it to the intent (intent→yields→fact).
@@ -1454,7 +1535,11 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary must not be empty")
 	}
-	payload := map[string]any{"summary": it.Summary}
+	source, err := normalizeFactSource(it.Source)
+	if err != nil {
+		return 0, err
+	}
+	payload := map[string]any{"summary": it.Summary, "source": source}
 	if it.Detail != "" {
 		payload["detail"] = it.Detail
 	}
@@ -1493,14 +1578,16 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"⚠️Write only conclusions you [actually saw] in tool output — don't extrapolate. evidence and confidence keep inaccurate conclusions from polluting the graph:\n"+
 		"  · evidence = [one line] of key evidence supporting this conclusion (the command + the one or two most proving output lines), **keep it brief** — details belong in detail; don't paste large output blocks here.\n"+
 		"  · confidence = observed (seen directly in output) | inferred (inferred from phenomena).\n"+
+		"  · source = where the content came from: target_response (content the target itself returned: page bodies, headers, error messages, banners, even when a tool fetched it) | tool_output (a tool's own result about the target: port states, scanner verdicts, status codes, timings) | third_party_intel (OSINT, CVE databases, public reports) | operator_input (given by the human operator) | inference (your own reasoning; the default when omitted). Any other value is refused.\n"+
 		"  · **Negative conclusions** (not injectable / port closed / no entry found, etc.) state only \"observation + tentative reading\" — state what you actually saw; whether to abandon the direction is for the planner to decide globally; always provide evidence, mark inferred when the means weren't exhausted or the evidence is weak (including probed only once, looks-like), and mark observed only when truly exhausted and directly seen.",
 		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "[use when there are several distinct conclusions] array of facts; element fields same as the top-level fields below (summary/detail/evidence/confidence/intent_id/asset_ids); omitting intent_id falls back to the top-level intent_id. The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
+			"facts":      map[string]any{"type": "array", "description": "[use when there are several distinct conclusions] array of facts; element fields same as the top-level fields below (summary/detail/evidence/confidence/source/intent_id/asset_ids); omitting intent_id falls back to the top-level intent_id. The returned ids match this array in length and order.", "items": map[string]any{"type": "object"}},
 			"summary":    str("a [one-sentence summary] of this exploration's conclusion (a condensation of detail)"),
 			"intent_id":  idp("the id of the intent that produced this fact (the intent you claimed; the default for each item in batch mode)"),
 			"detail":     str("details related to this fact: write all of this exploration's observations here"),
 			"evidence":   str("[one line] of key evidence: the command + the one or two most proving output lines. Keep it brief; don't paste large output blocks (details go in detail)."),
 			"confidence": str("observed (seen directly in output) | inferred (inferred from phenomena). Always label negative conclusions honestly."),
+			"source":     map[string]any{"type": "string", "enum": factSources, "description": "where the content came from: target_response | tool_output | third_party_intel | operator_input | inference (default when omitted)"},
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "related asset ids (optional, 0/1/many): which assets this fact involves"},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
@@ -1547,8 +1634,9 @@ type hintItem struct {
 	TrafficRefs []db.TrafficRef   `json:"traffic_refs"`
 }
 
-// addOneHint attaches a hint node (active/human) to the exploration graph, optionally
-// anchored to assets; returns the id.
+// addOneHint attaches a hint node (active) to the exploration graph, optionally
+// anchored to assets; returns the id. Its origin is t.worker, the agent that wrote
+// it: "human" for the main-agent chat, "orchestrator" for cross-task orchestration.
 func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	if len(it.TrafficRefs) > 0 && !findingTrafficBindingEnabled() {
 		return 0, fmt.Errorf("automatic agent traffic binding is off; the hint carrying traffic_refs was not saved — enable it in system settings, or hand over text only")
@@ -1573,7 +1661,7 @@ func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 	// Waking the planner is not done here per item — addHint fires it once after the
 	// whole batch is written (carrying the hint texts), so one add_hint with multiple
 	// hints doesn't spam the planner's trigger lines one by one.
-	return t.ts.AddNode(db.KindHint, payload, 0, "active", "human", anchors)
+	return t.ts.AddNode(db.KindHint, payload, 0, "active", t.worker, anchors)
 }
 
 type goalItem struct {
@@ -1763,7 +1851,7 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 }
 
 func (t *ToolSet) addHint() actool.CoreTool {
-	return t.writeExpTool("add_hint", "Attach a strategic hint from the human/main agent to the exploration graph; the planner reads it the next time it generates intents.\n"+
+	return t.writeExpTool("add_hint", "Attach a strategic hint to the exploration graph; the planner reads it the next time it generates intents. The hint is stored with the calling agent as its origin (human for the main-agent chat, orchestrator for cross-task orchestration, otherwise the agent's name).\n"+
 		"★Batch preferred: put multiple hints in the hints array in a single submission (saves round trips vs. one call per item). Returns an ids array, same length and order as hints (failed items get id=0, details in errors). For a single hint, omit hints and pass the top-level text.",
 		obj(map[string]any{
 			"hints":        map[string]any{"type": "array", "description": "[Prefer this] array of hints to add, processed in order. Each element has the same fields as the top-level ones below (text/asset_ids/traffic_refs). The returned ids match this array in length and order.", "items": obj(map[string]any{"text": str("hint content"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}, "traffic_refs": HintTrafficSchema()})},
@@ -1797,13 +1885,13 @@ func (t *ToolSet) addHint() actool.CoreTool {
 			}
 			if len(addedTexts) > 0 {
 				// Wake the planner (once for the whole batch). Prefer notifyHint: one
-				// add_hint records a single "human added N strategic hints: …" trigger, so
-				// the planner knows "this round was fired by a new hint" and sees its
-				// content; when the callback isn't wired, fall back to plain notify (bare
-				// wake; the hint is still folded into the graph for it to read).
+				// add_hint records a single "<origin> added N strategic hints: …" trigger,
+				// so the planner knows "this round was fired by a new hint", who wrote it,
+				// and sees its content; when the callback isn't wired, fall back to plain
+				// notify (bare wake; the hint is still folded into the graph for it to read).
 				switch {
 				case t.notifyHint != nil:
-					t.notifyHint(addedTexts)
+					t.notifyHint(t.worker, addedTexts)
 				case t.notify != nil:
 					t.notify()
 				}

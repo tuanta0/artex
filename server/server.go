@@ -147,6 +147,9 @@ type triggeredRun struct {
 	taskDesc  string // task description (task-level, same across one task); rendered once when merged
 	taskGoal  string // task goal (task-level, same across one task); rendered once when merged
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
+	// targetGate: the source task had the target gate on when the event fired; a
+	// merged run is gated if any of its fires is. Never carries pins.
+	targetGate bool
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
@@ -189,7 +192,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Wire DB-stored prompt templates into the agents (new design plan §3.3 / §5a). With no
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
-		agent.PromptOverride = func(key string) (string, bool) {
+		agent.SetPromptOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
 				return "", false
@@ -199,38 +202,38 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 				return "", false
 			}
 			return t, true
-		}
+		})
 		// Wire DB-stored wrap-up (settlement) prompts. Empty column → built-in default.
-		agent.WrapupOverride = func(key string) (string, bool) {
+		agent.SetWrapupOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.WrapupPrompt == "" {
 				return "", false
 			}
 			return a.WrapupPrompt, true
-		}
+		})
 		// Wire DB-stored wrap-up turn budgets. 0 / missing → built-in per-agent default.
-		agent.WrapupMaxTurnsOverride = func(key string) (int, bool) {
+		agent.SetWrapupMaxTurnsOverride(func(key string) (int, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.WrapupMaxTurns <= 0 {
 				return 0, false
 			}
 			return a.WrapupMaxTurns, true
-		}
+		})
 		// Wire DB-stored TASK-TIMEOUT wrap-up prompt/turns (worker/planner). Empty/0 → default.
-		agent.WrapupTaskTimeoutOverride = func(key string) (string, bool) {
+		agent.SetWrapupTaskTimeoutOverride(func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupPrompt == "" {
 				return "", false
 			}
 			return a.TaskTimeoutWrapupPrompt, true
-		}
-		agent.WrapupTaskTimeoutTurnsOverride = func(key string) (int, bool) {
+		})
+		agent.SetWrapupTaskTimeoutTurnsOverride(func(key string) (int, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil || a.TaskTimeoutWrapupMaxTurns <= 0 {
 				return 0, false
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
-		}
+		})
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // wire visible skills/MCP + traffic/orchestration host tools into the agent toolset
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg)   // built-in tools table: filter per agent + override description/schema + inject defaults
@@ -715,6 +718,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptUpdateRule)
 	mux.HandleFunc("DELETE /api/tasks/{id}/intercept-rules/{rid}", s.taskInterceptDeleteRule)
 	mux.HandleFunc("POST /api/tasks/{id}/intercept-rules/{rid}/toggle", s.taskInterceptToggleRule)
+	mux.HandleFunc("GET /api/tasks/{id}/target-pins", s.taskListTargetPins)
+	mux.HandleFunc("POST /api/tasks/{id}/target-pins/{pid}/revoke", s.taskRevokeTargetPin)
 	mux.HandleFunc("POST /api/tasks/control/batch", s.controlTasksBatch)
 	mux.HandleFunc("GET /api/task-archives", s.listTaskArchives)
 	mux.HandleFunc("GET /api/task-archives/{id}", s.getTaskArchive)
@@ -860,6 +865,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/messages", s.pgSendConversationMessage)
 	mux.HandleFunc("POST /api/conversations/{id}/stop", s.pgStopConversation)
 	mux.HandleFunc("GET /api/conversations/{id}/messages/{seq}", s.pgConversationMsgDetail)
+	mux.HandleFunc("GET /api/conversations/{id}/target-pins", s.convListTargetPins)
+	mux.HandleFunc("POST /api/conversations/{id}/target-pins/{pid}/revoke", s.convRevokeTargetPin)
 
 	mux.HandleFunc("GET /api/agents", s.pgListAgents)
 	mux.HandleFunc("POST /api/agents", s.pgCreateAgent)
@@ -951,12 +958,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
 	mux.HandleFunc("POST /api/intercept/pending/{id}/decide", s.interceptDecide)
+	mux.HandleFunc("POST /api/intercept/pending/{id}/always-allow", s.interceptAlwaysAllow) // creates an argv allow rule; the request stays pending
 	mux.HandleFunc("GET /api/intercept/history", s.interceptHistory)
 	mux.HandleFunc("GET /api/intercept/history/{id}", s.interceptDetail)
 	mux.HandleFunc("GET /api/intercept/history/{id}/execution", s.interceptExecution)
 	mux.HandleFunc("GET /api/intercept/task/{taskID}", s.interceptListTaskItems)
 	mux.HandleFunc("GET /api/intercept/tool-config", s.interceptGetToolConfig)
 	mux.HandleFunc("PUT /api/intercept/tool-config", s.interceptSetToolConfig)
+	mux.HandleFunc("GET /api/target-gate/exemptions", s.targetGateGetExemptions)
+	mux.HandleFunc("PUT /api/target-gate/exemptions", s.targetGateSetExemptions)
+	mux.HandleFunc("GET /api/target-gate/exemptions/history", s.targetGateExemptionHistory)
 	mux.HandleFunc("GET /api/intercept/judge", s.interceptGetJudgeConfig)
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // cumulative token usage of fallback approval
@@ -981,7 +992,12 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	out := map[string]any{"ok": true, "service": "artex", "version": BuildVersion}
+	// Opt-in only (ARTEX_UPDATE_CHECK); off, this returns "" without any request.
+	if latest := updates.newerVersion(r.Context(), time.Now(), BuildVersion); latest != "" {
+		out["latest_version"] = latest
+	}
+	writeJSON(w, 200, out)
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -1339,7 +1355,8 @@ func (s *Server) getLLM(w http.ResponseWriter, r *http.Request) {
 		"provider":         s.llmCfg.Provider(),
 		"model":            s.llmCfg.Model,
 		"base_url":         s.llmCfg.BaseURL,
-		"proxy":            s.llmCfg.Proxy,
+		"proxy":            maskedSecret(s.llmCfg.Proxy),
+		"proxy_set":        s.llmCfg.Proxy != "",
 		"key_set":          s.llmCfg.APIKey != "",
 		"rate_per_second":  s.llmCfg.RatePerSecond,
 		"rate_per_minute":  s.llmCfg.RatePerMinute,
@@ -1366,6 +1383,11 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if isMaskedSecret(req.Proxy) { // getLLM returns the proxy masked: keep the current one
+		s.cfgMu.Lock()
+		req.Proxy = s.llmCfg.Proxy
+		s.cfgMu.Unlock()
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
@@ -1437,6 +1459,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			stored = p
+		}
+	}
+	if isMaskedSecret(req.Proxy) { // the form echoes the masked proxy: test with the stored one
+		req.Proxy = ""
+		if stored == nil {
+			s.cfgMu.Lock()
+			req.Proxy = s.llmCfg.Proxy
+			s.cfgMu.Unlock()
 		}
 	}
 	if stored != nil {
@@ -1584,6 +1614,7 @@ type createTaskReq struct {
 	LLMRotate            *bool    `json:"llm_rotate"`             // task-level timeout (seconds); 0/omitted = no limit
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner heartbeat interval (seconds); 0/omitted = default 600 (10min); floor = default = 600, lower values are raised to 600
 	PlanQuietMode        *bool    `json:"plan_quiet_mode,omitempty"`   // planner quiet-mode switch (#86); omitted = default on; false = edge rounds always plan
+	TargetGate           *bool    `json:"target_gate,omitempty"`       // approval gate for asset targets, opt-in; omitted/null = off
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // issue one seed intent at creation (content = description + goal) so a worker can start right away without waiting for the first planner round; omitted/null = default off, the standard plan-then-execute flow. Pass true explicitly to enable (for CTF tasks often solved in one work, this skips the pre-start planner round).
 	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // asset coverage feature; omitted/null = default on (true). false = disables coverage calculation/display/auto-accumulated scope + hides add_task_scope/list_untested_assets. company links are unaffected.
 	// InterceptRules: task-level asset interception/allow rules (entered at creation, stored in task_intercept_rules, never the global table).
@@ -1660,6 +1691,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		CoverageEnabled: req.CoverageEnabled,
 		InterceptRules:  interceptRules,
 		LLMRotate:       req.LLMRotate,
+		TargetGate:      req.TargetGate,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -1922,10 +1954,16 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	cov, err := as.TaskCoverageWithSources(taskID)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		log.Printf("[coverage] coverage query failed for task %d: %v", taskID, err)
+		writeErr(w, 500, "coverage query failed")
 		return
 	}
 	cov.Enabled = true
+	if cov.CoverageLedger, err = as.CoverageLedger(taskID); err != nil {
+		log.Printf("[coverage] ledger query failed for task %d: %v", taskID, err)
+		writeErr(w, 500, "coverage ledger query failed")
+		return
+	}
 	writeJSON(w, 200, cov)
 }
 
@@ -3463,8 +3501,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":       backend,
 		"brave_key_set":            strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":           strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":         proxy,                       // dedicated egress proxy (http/https/socks5), empty = direct
-		"global_proxy":             s.m.GlobalProxy(),           // global egress proxy (http/https/socks5), all target traffic goes through it, empty = direct
+		"web_search_proxy":         maskedSecret(proxy), // proxies may carry user:pass: masked when set, "" = direct
+		"web_search_proxy_set":     proxy != "",
+		"global_proxy":             maskedSecret(s.m.GlobalProxy()), // global egress proxy, masked when set, "" = direct
+		"global_proxy_set":         s.m.GlobalProxy() != "",
 		"python_interpreter":       strings.TrimSpace(pyStored), // user/auto-set value (empty = use runtime detection)
 		"workers":                  s.m.Workers(),               // number of concurrent worker agents (default 3); applies to tasks started afterwards
 		"task_concurrency_enabled": concOn,                      // task concurrency cap switch (default off)
@@ -3567,6 +3607,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// A masked placeholder echoed back keeps the stored secret, like null.
+	req.BraveKey, req.TavilyKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey)
+	req.WebSearchProxy, req.GlobalProxy = keepIfMasked(req.WebSearchProxy), keepIfMasked(req.GlobalProxy)
 	if req.ConstraintsInjectPlanner != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {
 			writeErr(w, 500, err.Error())
@@ -3764,13 +3807,17 @@ func (s *Server) testWebSearch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	_, backend, storedBraveKey, storedTavilyKey, _ := s.m.WebSearch()
+	_, backend, storedBraveKey, storedTavilyKey, storedProxy := s.m.WebSearch()
 	if strings.TrimSpace(req.Backend) != "" {
 		backend = req.Backend
 	}
 	// Proxy is taken from the form as-is (empty = direct), so testing reflects exactly
 	// what's shown — including an intentional "clear proxy to test direct" before saving.
+	// The masked placeholder the form shows for a saved proxy means the saved one.
 	proxy := strings.TrimSpace(req.Proxy)
+	if isMaskedSecret(proxy) {
+		proxy = storedProxy
+	}
 	// API keys are secrets the form omits when already saved, so fall back to stored.
 	braveKey := storedBraveKey
 	if strings.TrimSpace(req.BraveKey) != "" {
@@ -3940,8 +3987,14 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			// taskDir = the agent's working directory (CWD), consistent with chatUpload's target dir and ensureRunDir.
 			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
+			// Tag the turn for the target gate: the task, the "mainagent" lane and the approval scope.
+			gctx := intercept.WithTaskContext(ctx, t.ID, "mainagent", func(a db.Activity) {
+				a.Worker = "mainagent"
+				emit(a)
+			})
+			gctx = intercept.WithTargetScope(gctx, t.targetScope(intercept.DefaultTargetWaitBound))
 			s.engine.BeginLLMCall(t.ID)
-			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
+			_, err := ma.Chat(gctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, t.TargetGuard.Hooks(), emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
 			s.engine.EndLLMCall(t.ID)
 			if err != nil && ctx.Err() == nil {
 				s.engine.emitActivity(t, db.Activity{Worker: "mainagent", Kind: "text", IsError: true, Summary: "(main agent error: " + err.Error() + ")", MainSeg: segPtr})
@@ -4044,9 +4097,14 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			counts[ty] = len(ns)
 		}
 	}
+	var ledger *db.CoverageLedger
+	if t.CoverageEnabled {
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		ledger, _ = s.m.Assets().CoverageLedger(taskID)
+	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		AssetCounts: counts, Findings: findings, Coverage: ledger,
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

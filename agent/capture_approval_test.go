@@ -37,7 +37,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{"ApprovalAuditProbe"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, Mode: intercept.JudgeModeFreeform, FailAction: "allow", AskTimeoutSeconds: 1, AskTimeoutAction: "allow"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -70,7 +70,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if err := ic.Decide(detail.ID, tc.approve); err != nil {
+				if err := ic.Decide(detail.ID, tc.approve, "", ""); err != nil {
 					t.Error(err)
 				}
 			})

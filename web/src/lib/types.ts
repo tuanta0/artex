@@ -350,7 +350,7 @@ export interface WorkspaceFile {
   content?: string;
 }
 
-// One row of a task's test scope (coverage denominator + authorization boundary).
+// One row of a task's test scope (coverage denominator; coverage scope, not enforced).
 export interface TaskScopeRow {
   id: number;
   task_id: number;
@@ -500,6 +500,8 @@ export interface Finding {
   poe_level?: number; // proof-of-exploitation level (3 or 4 when verified); 0 = none declared
   verification_status?: VerificationStatus; // automated verification outcome (S1)
   verification_note?: string; // why the status was reached; empty when verified
+  counterevidence?: string; // what was tested and did not work; optional, omitted when empty
+  confidence_rationale?: string; // why the conclusion holds; optional, omitted when empty
   id: string;
   finding_id?: string; // row id in the standalone findings table, the handle for status updates (may be missing for old in-task nodes)
   vulnclass: string;
@@ -1276,7 +1278,8 @@ export interface Stats {
 // ---- Intercept Rules ----
 export type InterceptAction = "allow" | "deny" | "ask";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
-export type InterceptMatchType = "string" | "regex";
+// argv: pattern is a JSON array of tokens, the prefix of a Bash command (program and subcommands; flags are not constrained).
+export type InterceptMatchType = "string" | "regex" | "argv";
 
 export interface InterceptRule {
   id: number;
@@ -1370,6 +1373,7 @@ export interface InterceptPending {
 // JudgeConfig: global config for model fallback approval (the model decides only when no interception rule matches).
 export interface JudgeConfig {
   enabled: boolean;
+  mode?: "closed" | "freeform"; // closed (default): fixed questions, code decides; freeform: the prompt decides
   profile_id: number; // 0 = follow the active/default profile
   prompt: string; // verdict prompt; on GET the backend backfills the full built-in template when unset
   timeout_seconds: number; // model call timeout
@@ -1548,6 +1552,7 @@ export interface InterceptAudit {
   rule_name?: string;
   config_digest?: string;
   profile_id?: number;
+  judge_answers?: { id: string; answer: "yes" | "no" | "unknown"; evidence: string }[];
   execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
   output?: string;
   output_truncated?: boolean;
@@ -1555,6 +1560,7 @@ export interface InterceptAudit {
 }
 export interface InterceptDetail extends InterceptApprovalRow {
   audit: InterceptAudit | null;
+  always_allow_prefix?: string; // pending Bash request: the argv prefix "always allow" would allow
 }
 
 export type TrafficEvidenceRole = "baseline" | "proof" | "verification" | "supporting";
